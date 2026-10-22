@@ -89,6 +89,31 @@ public class Window extends JPanel
         }
     }
 
+    static class CollisionLine {
+        float x1, y1, x2, y2;
+        boolean isoneway;
+        int orientation, orientation2;
+
+        CollisionLine(float x1, float y1, float x2, float y2,
+                      boolean isoneway, int orientation, int orientation2) {
+            this.x1 = x1;
+            this.y1 = y1;
+            this.x2 = x2;
+            this.y2 = y2;
+            this.isoneway = isoneway;
+            this.orientation = orientation;
+            this.orientation2 = orientation2;
+        }
+    }
+
+    List<CollisionLine> collisionLines = new ArrayList<>();
+    int selectedLine = -1;
+    int lineStartX, lineStartY;
+    boolean drawingLine = false;
+    boolean lineOneWay = false;
+    int lineOrientation = 0;
+    int lineOrientation2 = 0;
+
     List<Placed> entities = new ArrayList<>();
     List<Placed> events = new ArrayList<>();
     List<String> entityTypes = new ArrayList<>();
@@ -101,8 +126,10 @@ public class Window extends JPanel
     boolean evApplyAll = false;
     boolean evUp = true;
 
-    static final int TAB_TILES = 0, TAB_LAYERS = 1, TAB_ENTITY = 2, TAB_EVENT = 3;
-    String[] tabNames = {"Tiles", "Layers", "Entity", "Event"};
+    static final int TAB_TILES = 0, TAB_LAYERS = 1, TAB_ENTITY = 2, TAB_EVENT = 3, TAB_COLLISION = 4;
+    String[] tabNames = {
+        "Tiles", "Layers", "Entity", "Event", "Collision"
+    };
     int currentTab = TAB_TILES;
     int scroll = 0;
 
@@ -153,6 +180,9 @@ public class Window extends JPanel
         layerVisible.clear();
         entities.clear();
         events.clear();
+        collisionLines.clear();
+        selectedLine = -1;
+        drawingLine = false;
         addLayer();
         currentLayer = 0;
         cameraX = 0;
@@ -177,7 +207,7 @@ public class Window extends JPanel
         p.add(w);
         p.add(new JLabel("Height (tiles):"));
         p.add(h);
-        int r = JOptionPane.showConfirmDialog(this, p, "New Map (this clears the current one)",
+        int r = JOptionPane.showConfirmDialog(this, p, "Resize Map (this clears the current one)",
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
         if (r != JOptionPane.OK_OPTION) return;
         try {
@@ -276,6 +306,19 @@ public class Window extends JPanel
         return n;
     }
 
+    int tileAt(int gx, int gy) {
+        if (!inBounds(gx, gy)) return -1;
+        return layers.get(currentLayer)[gx][gy];
+    }
+    
+    public int[][] getSurroundingTiles(int gx, int gy) {
+        return new int[][]{
+            {tileAt(gx - 1, gy - 1), tileAt(gx, gy - 1), tileAt(gx + 1, gy - 1)},
+            {tileAt(gx - 1, gy),     tileAt(gx, gy),     tileAt(gx + 1, gy)},
+            {tileAt(gx - 1, gy + 1), tileAt(gx, gy + 1), tileAt(gx + 1, gy + 1)}
+        };
+    }
+
     public void saveMap(File dir, String base) throws IOException {
         List<String> meta = new ArrayList<>();
         meta.add("width=" + mapWidth);
@@ -308,6 +351,20 @@ public class Window extends JPanel
         List<String> ev = new ArrayList<>();
         for (Placed p : events) ev.add(p.name + " " + p.x + " " + p.y + " " + p.args);
         write(new File(dir, base + "_events.txt"), ev);
+
+        List<String> collisionData = new ArrayList<>();
+
+        for (CollisionLine line : collisionLines) {
+            collisionData.add(
+                line.x1 + " " + line.y1 + " " +
+                line.x2 + " " + line.y2 + " " +
+                line.isoneway + " " +
+                line.orientation + " " +
+                line.orientation2
+            );
+        }
+
+        write(new File(dir, base + "_collisions.txt"), collisionData);
     }
 
     void write(File f, List<String> lines) throws IOException {
@@ -378,7 +435,39 @@ public class Window extends JPanel
             } catch (IOException ignored) {
             }
         }
+        loadCollisionLines(dir, base);
         rebuildMini();
+    }
+
+    void loadCollisionLines(File dir, String base) throws IOException {
+        collisionLines.clear();
+        selectedLine = -1;
+
+        File file = new File(dir, base + "_collisions.txt");
+        if (!file.exists()) return; // Older maps can still load.
+
+        List<String> lines = Files.readAllLines(
+            file.toPath(), StandardCharsets.UTF_8
+        );
+
+        for (String line : lines) {
+            if (line.trim().isEmpty()) continue;
+
+            String[] t = line.trim().split("\\s+");
+            if (t.length != 7) {
+                throw new IOException("Invalid collision line: " + line);
+            }
+
+            collisionLines.add(new CollisionLine(
+                Float.parseFloat(t[0]),
+                Float.parseFloat(t[1]),
+                Float.parseFloat(t[2]),
+                Float.parseFloat(t[3]),
+                Boolean.parseBoolean(t[4]),
+                Integer.parseInt(t[5]),
+                Integer.parseInt(t[6])
+            ));
+        }
     }
 
     void computeMiniRect() {
@@ -518,6 +607,7 @@ public class Window extends JPanel
 
         drawEntities(g2);
         drawEvents(g2);
+        drawCollisionLines(g2);
         g2.setClip(null);
     }
 
@@ -650,10 +740,208 @@ public class Window extends JPanel
             case TAB_LAYERS: drawLayersTab(g2, bg); break;
             case TAB_ENTITY: drawNameList(g2, bg, "Add Entity", entityTypes, selEntity,
                     "Click map: place on layer " + currentLayer + ". Right click: remove."); break;
+            case TAB_COLLISION: drawCollisionTab(g2, bg);break;
             default: drawNameList(g2, bg, "Add Event", eventTypes, selEvent,
                     "Click places, right click removes. Options apply on place."); break;
+                
         }
         g2.setClip(null);
+    }
+
+    int snap(double v) {
+    int half = tile / 2;
+    return (int) Math.round(v / half) * half;
+}
+
+int snapX(double screenX) {
+    return Math.max(0, Math.min(mapWidth * tile, snap(screenX + cameraX)));
+}
+
+int snapY(double screenY) {
+    return Math.max(0, Math.min(mapHeight * tile, snap(screenY + cameraY)));
+}
+
+int nearestLine(double px, double py, double maxDist) {
+    int best = -1;
+    double bestDist = maxDist;
+    for (int i = 0; i < collisionLines.size(); i++) {
+        CollisionLine l = collisionLines.get(i);
+        double dx = l.x2 - l.x1, dy = l.y2 - l.y1;
+        double len2 = dx * dx + dy * dy;
+        double t = len2 == 0 ? 0 : Math.max(0, Math.min(1, ((px - l.x1) * dx + (py - l.y1) * dy) / len2));
+        double d = Math.hypot(px - (l.x1 + t * dx), py - (l.y1 + t * dy));
+        if (d <= bestDist) {
+            bestDist = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
+void collisionClick(boolean remove) {
+    double wx = mx + cameraX, wy = my + cameraY;
+    if (wx < -16 || wy < -16 || wx > mapWidth * tile + 16 || wy > mapHeight * tile + 16) return;
+
+    if (remove) {
+        if (drawingLine) {
+            drawingLine = false;
+            return;
+        }
+        int i = nearestLine(wx, wy, 10);
+        if (i >= 0) {
+            collisionLines.remove(i);
+            if (selectedLine == i) selectedLine = -1;
+            else if (selectedLine > i) selectedLine--;
+        }
+        return;
+    }
+
+    int px = snapX(mx), py = snapY(my);
+    if (!drawingLine) {
+        lineStartX = px;
+        lineStartY = py;
+        drawingLine = true;
+        return;
+    }
+
+    drawingLine = false;
+    if (px == lineStartX && py == lineStartY) return;
+    collisionLines.add(new CollisionLine(lineStartX, lineStartY, px, py, lineOneWay, lineOrientation, lineOrientation2));
+}
+
+void clickCollision(int x, int y) {
+    if (collisionOneWayRect().contains(x, y)) {
+        lineOneWay = !lineOneWay;
+    } else if (collisionOrientationRect().contains(x, y)) {
+        lineOrientation = (lineOrientation + 1) % 5;
+    } else if (collisionOrientation2Rect().contains(x, y)) {
+        lineOrientation2 = (lineOrientation2 + 1) % 5;
+    } else {
+        int startY = CONTENT_Y + 196;
+        int rowHeight = 28;
+        if (y < startY) return;
+        for (int i = 0; i < collisionLines.size(); i++) {
+            int ry = startY + i * rowHeight - scroll;
+            if (y >= ry && y < ry + rowHeight - 2) {
+                selectedLine = i;
+                return;
+            }
+        }
+    }
+}
+
+void drawCollisionLines(Graphics2D g2) {
+    g2.setStroke(new BasicStroke(3));
+
+    for (int i = 0; i < collisionLines.size(); i++) {
+        CollisionLine line = collisionLines.get(i);
+
+        int x1 = Math.round(line.x1) - cameraX;
+        int y1 = Math.round(line.y1) - cameraY;
+        int x2 = Math.round(line.x2) - cameraX;
+        int y2 = Math.round(line.y2) - cameraY;
+
+        g2.setColor(i == selectedLine ? Color.YELLOW : Color.GREEN);
+        g2.drawLine(x1, y1, x2, y2);
+
+        g2.fillOval(x1 - 4, y1 - 4, 8, 8);
+        g2.fillOval(x2 - 4, y2 - 4, 8, 8);
+    }
+
+    if (currentTab == TAB_COLLISION && mx >= 0 && mx < viewW && !inMini(mx, my)) {
+        int px = snapX(mx) - cameraX, py = snapY(my) - cameraY;
+        if (drawingLine) {
+            g2.setColor(new Color(255, 255, 255, 160));
+            g2.drawLine(lineStartX - cameraX, lineStartY - cameraY, px, py);
+            g2.fillOval(lineStartX - cameraX - 5, lineStartY - cameraY - 5, 10, 10);
+        }
+        g2.setStroke(new BasicStroke(2));
+        g2.setColor(Color.CYAN);
+        g2.drawOval(px - 6, py - 6, 12, 12);
+    }
+
+    g2.setStroke(new BasicStroke(1));
+}
+
+void drawCollisionTab(Graphics2D g2, Color bg) {
+    int startY = CONTENT_Y + 196;
+    int rowHeight = 28;
+
+    g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 13f));
+    for (int i = 0; i < collisionLines.size(); i++) {
+        int y = startY + i * rowHeight - scroll;
+
+        if (y + rowHeight < CONTENT_Y || y > contentBottom) {
+            continue;
+        }
+
+        CollisionLine line = collisionLines.get(i);
+
+        g2.setColor(i == selectedLine
+                ? new Color(90, 80, 35)
+                : new Color(45, 45, 45));
+
+        g2.fillRect(contentX(), y, menuWidth - 40, rowHeight - 2);
+
+        g2.setColor(i == selectedLine ? Color.YELLOW : Color.LIGHT_GRAY);
+
+        String label = "Line " + i + ": ("
+                + Math.round(line.x1) + ", " + Math.round(line.y1)
+                + ") -> ("
+                + Math.round(line.x2) + ", " + Math.round(line.y2) + ")";
+
+        g2.drawString(label, contentX() + 6, y + 18);
+    }
+
+    g2.setColor(bg);
+    g2.fillRect(menuStartX, CONTENT_Y, menuWidth, startY - CONTENT_Y);
+
+    g2.setColor(Color.WHITE);
+    g2.setFont(g2.getFont().deriveFont(Font.BOLD, 14f));
+    g2.drawString("Collision Settings", contentX(), CONTENT_Y + 22);
+
+    drawButton(g2, collisionOneWayRect(),
+            "One-way: " + (lineOneWay ? "ON" : "OFF"));
+
+    drawButton(g2, collisionOrientationRect(),
+            "Orientation: " + orientationName(lineOrientation));
+
+    drawButton(g2, collisionOrientation2Rect(),
+            "Orientation 2: " + orientationName(lineOrientation2));
+
+    g2.setColor(Color.GRAY);
+    g2.setFont(g2.getFont().deriveFont(12f));
+    g2.drawString("Click to start a line, click again to finish it.",
+            contentX(), CONTENT_Y + 150);
+    g2.drawString("Right-click a line to erase it (or cancel one).",
+            contentX(), CONTENT_Y + 168);
+
+    g2.setColor(Color.WHITE);
+    g2.setFont(g2.getFont().deriveFont(Font.BOLD, 13f));
+    g2.drawString("Collision Lines (" + collisionLines.size() + ")",
+            contentX(), CONTENT_Y + 188);
+}
+
+    String orientationName(int orientation) {
+        switch (orientation) {
+            case 0: return "Top";
+            case 1: return "Right";
+            case 2: return "Bottom";
+            case 3: return "Left";
+            default: return "None";
+        }
+    }
+
+    java.awt.Rectangle collisionOneWayRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 36, 260, 28);
+    }
+
+    java.awt.Rectangle collisionOrientationRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 70, 260, 28);
+    }
+
+    java.awt.Rectangle collisionOrientation2Rect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 104, 260, 28);
     }
 
     void drawTilesTab(Graphics2D g2) {
@@ -772,6 +1060,7 @@ public class Window extends JPanel
         switch (currentTab) {
             case TAB_TILES: clickTiles(x, y); break;
             case TAB_LAYERS: clickLayers(x, y); break;
+            case TAB_COLLISION: clickCollision(x, y); break;
             case TAB_ENTITY:
                 if (buttonRect().contains(x, y)) {
                     String n = askName("Entity name (your game uses this to decide what to spawn):");
@@ -852,6 +1141,7 @@ public class Window extends JPanel
                 break;
             case TAB_LAYERS: end = listY() + layers.size() * ROW_H; break;
             case TAB_ENTITY: end = listY() + entityTypes.size() * ROW_H; break;
+            case TAB_COLLISION: end = CONTENT_Y + 196 + collisionLines.size() * 28; break;
             default: end = listY() + eventTypes.size() * ROW_H; break;
         }
         return Math.max(0, end - contentBottom + 10);
@@ -877,6 +1167,11 @@ public class Window extends JPanel
             return;
         }
         dragMode = 2;
+
+        if (currentTab == TAB_COLLISION) {
+            collisionClick(button == MouseEvent.BUTTON3);
+        }
+
         if (currentTab == TAB_ENTITY || currentTab == TAB_EVENT) {
             int gx = (int) Math.floor((mx + cameraX) / tile);
             int gy = (int) Math.floor((my + cameraY) / tile);
@@ -935,7 +1230,7 @@ public class Window extends JPanel
             Window window = new Window(frame);
 
             JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT));
-            toolbar.add(toolbarButton("New Map", window::newMapDialog));
+            toolbar.add(toolbarButton("Resize Map", window::newMapDialog));
             toolbar.add(toolbarButton("Import Tilesheet", window::importTilesheetDialog));
             toolbar.add(toolbarButton("Save", window::saveDialog));
             toolbar.add(toolbarButton("Load", window::loadDialog));
