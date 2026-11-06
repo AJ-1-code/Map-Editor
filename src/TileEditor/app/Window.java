@@ -44,7 +44,10 @@ import javax.swing.Timer;
  *   Left mouse .......... draw tile / place entity / place event
  *   Right mouse ......... erase tile / remove entity / remove event
  *   Click the minimap ... jump the camera there
- *   Mouse wheel ......... scroll the sidebar
+ *   Mouse wheel ......... zoom the map (scroll the sidebar when over it)
+ *   B / R / F / V ....... brush / square / fill / select tool
+ *   Ctrl+Z / Ctrl+Y ..... undo / redo
+ *   0 ................... reset zoom
  */
 public class Window extends JPanel
         implements MouseListener, MouseMotionListener, MouseWheelListener, KeyListener {
@@ -69,6 +72,7 @@ public class Window extends JPanel
     List<int[][]> layers = new ArrayList<>();
     List<Boolean> layerVisible = new ArrayList<>();
     int currentLayer = 0;
+    public boolean drawlines = true;
 
     public Tile[] tiles;
     int selectedTileIndex = -1;
@@ -114,6 +118,52 @@ public class Window extends JPanel
     int lineOrientation = 0;
     int lineOrientation2 = 0;
 
+    static class EditOp {
+        int layer;
+        int[] data = new int[256];
+        int size;
+
+        void add(int x, int y, int oldValue, int newValue) {
+            if (size + 4 > data.length) data = Arrays.copyOf(data, data.length * 2);
+            data[size++] = x;
+            data[size++] = y;
+            data[size++] = oldValue;
+            data[size++] = newValue;
+        }
+    }
+
+    static final int TOOL_BRUSH = 0, TOOL_SQUARE = 1, TOOL_FILL = 2, TOOL_SELECT = 3;
+    static final int TOOLS_H = 150;
+    static final int NONE = Integer.MIN_VALUE;
+    static final float MIN_ZOOM = 0.05f, MAX_ZOOM = 10f;
+
+    String[] toolNames = {"Brush", "Square", "Fill", "Select"};
+    String[] selectButtons = {"Copy", "Cut", "Paste", "Delete"};
+    int tool = TOOL_BRUSH;
+    int brushSize = 1;
+    boolean brushRound = false;
+    boolean squareFilled = true;
+    boolean sliderDrag = false;
+    float zoom = 1f;
+
+    int strokeLastX = NONE, strokeLastY = NONE;
+    int rectStartX, rectStartY;
+    boolean rectDragging = false;
+
+    boolean selActive = false;
+    int selX, selY, selW, selH;
+    int selMode = 0;
+    int selAnchorX, selAnchorY;
+    int moveOffX, moveOffY;
+    int liftX, liftY;
+    boolean floatFromPaste = false;
+    int[][] floatBuf;
+    int[][] clipboard;
+
+    EditOp openOp;
+    List<EditOp> undoStack = new ArrayList<>();
+    List<EditOp> redoStack = new ArrayList<>();
+
     List<Placed> entities = new ArrayList<>();
     List<Placed> events = new ArrayList<>();
     List<String> entityTypes = new ArrayList<>();
@@ -127,14 +177,13 @@ public class Window extends JPanel
     boolean evUp = true;
 
     static final int TAB_TILES = 0, TAB_LAYERS = 1, TAB_ENTITY = 2, TAB_EVENT = 3, TAB_COLLISION = 4;
-    String[] tabNames = {
-        "Tiles", "Layers", "Entity", "Event", "Collision"
-    };
+    String[] tabNames = {"Tiles", "Layers", "Entity", "Event", "Collision"};
     int currentTab = TAB_TILES;
     int scroll = 0;
 
     // camera
-    int cameraX = 0, cameraY = 0, cameraSpeed = 8;
+    float cameraX = 0, cameraY = 0;
+    int cameraSpeed = 8;
     boolean keyW, keyA, keyS, keyD;
 
     // mouse
@@ -174,6 +223,7 @@ public class Window extends JPanel
     }
 
     public void newMap(int w, int h) {
+        resetEditState();
         mapWidth = w;
         mapHeight = h;
         layers.clear();
@@ -207,7 +257,7 @@ public class Window extends JPanel
         p.add(w);
         p.add(new JLabel("Height (tiles):"));
         p.add(h);
-        int r = JOptionPane.showConfirmDialog(this, p, "Resize Map (this clears the current one)",
+        int r = JOptionPane.showConfirmDialog(this, p, "New Map (this clears the current one)",
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
         if (r != JOptionPane.OK_OPTION) return;
         try {
@@ -226,7 +276,7 @@ public class Window extends JPanel
         if (fd.getFile() == null) return;
         File f = new File(fd.getDirectory(), fd.getFile());
 
-        String in = JOptionPane.showInputDialog(this, "Enter the Tile Size (in pixels):", "32");
+        String in = JOptionPane.showInputDialog(this, "Enter the Tile Size (in pixels):", "16");
         if (in == null || in.trim().isEmpty()) return;
         try {
             loadTilesheet(f, Integer.parseInt(in.trim()), true);
@@ -244,7 +294,7 @@ public class Window extends JPanel
         try {
             saveMap(chosen.getParentFile(), baseOf(chosen));
             JOptionPane.showMessageDialog(this, "Saved " + baseOf(chosen) + " (" + layers.size()
-                    + " layers, " + entities.size() + " entities, " + events.size() + " events)");
+                    + " layers, " + entities.size() + " entities, " + events.size() + " events, " + collisionLines.size() + " collision lines)");
         } catch (IOException ex) {
             showError("Save failed: " + ex.getMessage());
         }
@@ -306,20 +356,8 @@ public class Window extends JPanel
         return n;
     }
 
-    int tileAt(int gx, int gy) {
-        if (!inBounds(gx, gy)) return -1;
-        return layers.get(currentLayer)[gx][gy];
-    }
-    
-    public int[][] getSurroundingTiles(int gx, int gy) {
-        return new int[][]{
-            {tileAt(gx - 1, gy - 1), tileAt(gx, gy - 1), tileAt(gx + 1, gy - 1)},
-            {tileAt(gx - 1, gy),     tileAt(gx, gy),     tileAt(gx + 1, gy)},
-            {tileAt(gx - 1, gy + 1), tileAt(gx, gy + 1), tileAt(gx + 1, gy + 1)}
-        };
-    }
-
     public void saveMap(File dir, String base) throws IOException {
+        commitFloating();
         List<String> meta = new ArrayList<>();
         meta.add("width=" + mapWidth);
         meta.add("height=" + mapHeight);
@@ -444,7 +482,7 @@ public class Window extends JPanel
         selectedLine = -1;
 
         File file = new File(dir, base + "_collisions.txt");
-        if (!file.exists()) return; // Older maps can still load.
+        if (!file.exists()) return;
 
         List<String> lines = Files.readAllLines(
             file.toPath(), StandardCharsets.UTF_8
@@ -503,34 +541,40 @@ public class Window extends JPanel
     }
 
     public void update() {
-        if (keyW) cameraY -= cameraSpeed;
-        if (keyS) cameraY += cameraSpeed;
-        if (keyA) cameraX -= cameraSpeed;
-        if (keyD) cameraX += cameraSpeed;
+        float step = cameraSpeed / zoom;
+        if (keyW) cameraY -= step;
+        if (keyS) cameraY += step;
+        if (keyA) cameraX -= step;
+        if (keyD) cameraX += step;
         clampCamera();
 
         if (!pressed) return;
 
         if (dragMode == 1) {
-            cameraX = (int) ((mx - miniX) / miniScale * tile - viewW / 2.0);
-            cameraY = (int) ((my - miniY) / miniScale * tile - viewH / 2.0);
+            cameraX = (float) ((mx - miniX) / miniScale * tile - viewW / zoom / 2.0);
+            cameraY = (float) ((my - miniY) / miniScale * tile - viewH / zoom / 2.0);
             clampCamera();
-        } else if (dragMode == 2 && (currentTab == TAB_TILES || currentTab == TAB_LAYERS)) {
-            if (mx < 0 || my < 0 || mx >= viewW || my >= viewH) return;
-            int gx = (int) Math.floor((mx + cameraX) / tile);
-            int gy = (int) Math.floor((my + cameraY) / tile);
-            if (!inBounds(gx, gy)) return;
-            if (button == MouseEvent.BUTTON3) {
-                paintTile(gx, gy, -1);
-            } else if (tiles != null && selectedTileIndex >= 0 && selectedTileIndex < tiles.length) {
-                paintTile(gx, gy, selectedTileIndex);
+        } else if (dragMode == 2 && tileTab()) {
+            int gx = cellAtX(mx), gy = cellAtY(my);
+            boolean inView = mx >= 0 && my >= 0 && mx < viewW && my < viewH;
+            if (tool == TOOL_BRUSH) {
+                if (!inView) {
+                    strokeLastX = NONE;
+                    strokeLastY = NONE;
+                } else if (button == MouseEvent.BUTTON3) {
+                    strokeTo(gx, gy, -1);
+                } else if (hasTile()) {
+                    strokeTo(gx, gy, selectedTileIndex);
+                }
+            } else if (tool == TOOL_SELECT && selMode != 0) {
+                dragSelection(gx, gy);
             }
         }
     }
 
     void clampCamera() {
-        cameraX = Math.max(0, Math.min(cameraX, mapWidth * tile - viewW));
-        cameraY = Math.max(0, Math.min(cameraY, mapHeight * tile - viewH));
+        cameraX = Math.max(0, Math.min(cameraX, mapWidth * tile - viewW / zoom));
+        cameraY = Math.max(0, Math.min(cameraY, mapHeight * tile - viewH / zoom));
     }
 
     boolean inBounds(int gx, int gy) {
@@ -538,11 +582,7 @@ public class Window extends JPanel
     }
 
     void paintTile(int gx, int gy, int value) {
-        int[][] layer = layers.get(currentLayer);
-        if (layer[gx][gy] != value) {
-            layer[gx][gy] = value;
-            updateMiniPixel(gx, gy);
-        }
+        setTile(currentLayer, gx, gy, value);
     }
 
     void placeOrRemove(int gx, int gy, boolean remove) {
@@ -576,46 +616,57 @@ public class Window extends JPanel
     void drawWorld(Graphics2D g2) {
         g2.setClip(0, 0, viewW, viewH);
 
-        int startCol = cameraX / tile;
-        int endCol = Math.min(mapWidth, startCol + visCols + 1);
-        int startRow = cameraY / tile;
-        int endRow = Math.min(mapHeight, startRow + visRows + 1);
+        int c0 = visCol0(), c1 = visCol1(), r0 = visRow0(), r1 = visRow1();
 
         for (int l = 0; l < layers.size(); l++) {
             if (!layerVisible.get(l)) continue;
             int[][] layer = layers.get(l);
-            for (int x = startCol; x < endCol; x++) {
-                for (int y = startRow; y < endRow; y++) {
+            for (int x = c0; x <= c1; x++) {
+                int sx0 = Math.round((x * tile - cameraX) * zoom);
+                int sx1 = Math.round(((x + 1) * tile - cameraX) * zoom);
+                for (int y = r0; y <= r1; y++) {
                     int id = layer[x][y];
-                    if (id >= 0 && tiles != null && id < tiles.length) {
-                        g2.drawImage(tiles[id].subImage, x * tile - cameraX, y * tile - cameraY, tile, tile, null);
-                    }
+                    if (id < 0 || tiles == null || id >= tiles.length) continue;
+                    int sy0 = Math.round((y * tile - cameraY) * zoom);
+                    int sy1 = Math.round(((y + 1) * tile - cameraY) * zoom);
+                    g2.drawImage(tiles[id].subImage, sx0, sy0, sx1 - sx0, sy1 - sy0, null);
                 }
             }
         }
 
-        g2.setStroke(new BasicStroke(1));
-        g2.setColor(new Color(255, 255, 255, 40));
-        for (int x = startCol; x < endCol; x++) {
-            for (int y = startRow; y < endRow; y++) {
-                g2.drawRect(x * tile - cameraX, y * tile - cameraY, tile, tile);
+        java.awt.geom.AffineTransform base = g2.getTransform();
+        g2.scale(zoom, zoom);
+        g2.translate(-cameraX, -cameraY);
+        float px = 1f / zoom;
+
+        if (zoom >= 0.4f) {
+            g2.setStroke(new BasicStroke(px));
+            g2.setColor(new Color(255, 255, 255, 40));
+            for (int x = c0; x <= c1; x++) {
+                for (int y = r0; y <= r1; y++) {
+                    g2.drawRect(x * tile, y * tile, tile, tile);
+                }
             }
         }
 
+        g2.setStroke(new BasicStroke(px));
         g2.setColor(Color.RED);
-        g2.drawRect(-cameraX, -cameraY, mapWidth * tile, mapHeight * tile);
+        g2.drawRect(0, 0, mapWidth * tile, mapHeight * tile);
 
         drawEntities(g2);
         drawEvents(g2);
         drawCollisionLines(g2);
+        drawToolOverlay(g2);
+
+        g2.setTransform(base);
         g2.setClip(null);
     }
 
     void drawEntities(Graphics2D g2) {
         Font small = g2.getFont().deriveFont(Font.BOLD, 10f);
         for (Placed p : entities) {
-            int sx = p.x * tile - cameraX, sy = p.y * tile - cameraY;
-            if (sx + tile < 0 || sy + tile < 0 || sx > viewW || sy > viewH) continue;
+            int sx = p.x * tile, sy = p.y * tile;
+            if (!visibleWorld(sx, sy, tile, tile)) continue;
 
             boolean faded = currentTab == TAB_ENTITY && p.layer != currentLayer;
             if (faded) g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.35f));
@@ -642,8 +693,8 @@ public class Window extends JPanel
     void drawEvents(Graphics2D g2) {
         Font small = g2.getFont().deriveFont(Font.BOLD, 10f);
         for (Placed p : events) {
-            int sx = p.x * tile - cameraX, sy = p.y * tile - cameraY;
-            if (sx + tile < 0 || sy + tile < 0 || sx > viewW || sy > viewH) continue;
+            int sx = p.x * tile, sy = p.y * tile;
+            if (!visibleWorld(sx, sy, tile, tile)) continue;
 
             boolean layerEvent = p.name.equals("changeLayer");
             g2.setColor(layerEvent ? new Color(120, 90, 255, 110) : new Color(255, 160, 40, 110));
@@ -689,8 +740,8 @@ public class Window extends JPanel
         g2.setColor(Color.YELLOW);
         int rx = miniX + (int) (cameraX / (double) tile * miniScale);
         int ry = miniY + (int) (cameraY / (double) tile * miniScale);
-        int rw = (int) (Math.min(visCols, mapWidth) * miniScale);
-        int rh = (int) (Math.min(visRows, mapHeight) * miniScale);
+        int rw = (int) (Math.min(mapWidth, viewW / zoom / tile) * miniScale);
+        int rh = (int) (Math.min(mapHeight, viewH / zoom / tile) * miniScale);
         g2.drawRect(rx, ry, rw, rh);
     }
 
@@ -730,239 +781,21 @@ public class Window extends JPanel
 
         g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 13f));
         g2.setColor(Color.GRAY);
-        g2.drawString("Layer " + currentLayer + "  |  Camera " + cameraX + ", " + cameraY
-                + "  |  Map " + mapWidth + "x" + mapHeight, contentX(), getHeight() - 10);
+        g2.drawString("Layer " + currentLayer + " | Cam " + (int) cameraX + ", " + (int) cameraY
+                + " | Zoom " + Math.round(zoom * 100) + "% | Map " + mapWidth + "x" + mapHeight, contentX(), getHeight() - 10);
 
         g2.setClip(menuStartX, CONTENT_Y, menuWidth, contentBottom - CONTENT_Y);
         g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 16f));
         switch (currentTab) {
-            case TAB_TILES: drawTilesTab(g2); break;
+            case TAB_TILES: drawTilesTab(g2, bg); break;
             case TAB_LAYERS: drawLayersTab(g2, bg); break;
             case TAB_ENTITY: drawNameList(g2, bg, "Add Entity", entityTypes, selEntity,
                     "Click map: place on layer " + currentLayer + ". Right click: remove."); break;
-            case TAB_COLLISION: drawCollisionTab(g2, bg);break;
+            case TAB_COLLISION: drawCollisionTab(g2, bg); break;
             default: drawNameList(g2, bg, "Add Event", eventTypes, selEvent,
                     "Click places, right click removes. Options apply on place."); break;
-                
         }
         g2.setClip(null);
-    }
-
-    int snap(double v) {
-    int half = tile / 2;
-    return (int) Math.round(v / half) * half;
-}
-
-int snapX(double screenX) {
-    return Math.max(0, Math.min(mapWidth * tile, snap(screenX + cameraX)));
-}
-
-int snapY(double screenY) {
-    return Math.max(0, Math.min(mapHeight * tile, snap(screenY + cameraY)));
-}
-
-int nearestLine(double px, double py, double maxDist) {
-    int best = -1;
-    double bestDist = maxDist;
-    for (int i = 0; i < collisionLines.size(); i++) {
-        CollisionLine l = collisionLines.get(i);
-        double dx = l.x2 - l.x1, dy = l.y2 - l.y1;
-        double len2 = dx * dx + dy * dy;
-        double t = len2 == 0 ? 0 : Math.max(0, Math.min(1, ((px - l.x1) * dx + (py - l.y1) * dy) / len2));
-        double d = Math.hypot(px - (l.x1 + t * dx), py - (l.y1 + t * dy));
-        if (d <= bestDist) {
-            bestDist = d;
-            best = i;
-        }
-    }
-    return best;
-}
-
-void collisionClick(boolean remove) {
-    double wx = mx + cameraX, wy = my + cameraY;
-    if (wx < -16 || wy < -16 || wx > mapWidth * tile + 16 || wy > mapHeight * tile + 16) return;
-
-    if (remove) {
-        if (drawingLine) {
-            drawingLine = false;
-            return;
-        }
-        int i = nearestLine(wx, wy, 10);
-        if (i >= 0) {
-            collisionLines.remove(i);
-            if (selectedLine == i) selectedLine = -1;
-            else if (selectedLine > i) selectedLine--;
-        }
-        return;
-    }
-
-    int px = snapX(mx), py = snapY(my);
-    if (!drawingLine) {
-        lineStartX = px;
-        lineStartY = py;
-        drawingLine = true;
-        return;
-    }
-
-    drawingLine = false;
-    if (px == lineStartX && py == lineStartY) return;
-    collisionLines.add(new CollisionLine(lineStartX, lineStartY, px, py, lineOneWay, lineOrientation, lineOrientation2));
-}
-
-void clickCollision(int x, int y) {
-    if (collisionOneWayRect().contains(x, y)) {
-        lineOneWay = !lineOneWay;
-    } else if (collisionOrientationRect().contains(x, y)) {
-        lineOrientation = (lineOrientation + 1) % 5;
-    } else if (collisionOrientation2Rect().contains(x, y)) {
-        lineOrientation2 = (lineOrientation2 + 1) % 5;
-    } else {
-        int startY = CONTENT_Y + 196;
-        int rowHeight = 28;
-        if (y < startY) return;
-        for (int i = 0; i < collisionLines.size(); i++) {
-            int ry = startY + i * rowHeight - scroll;
-            if (y >= ry && y < ry + rowHeight - 2) {
-                selectedLine = i;
-                return;
-            }
-        }
-    }
-}
-
-void drawCollisionLines(Graphics2D g2) {
-    g2.setStroke(new BasicStroke(3));
-
-    for (int i = 0; i < collisionLines.size(); i++) {
-        CollisionLine line = collisionLines.get(i);
-
-        int x1 = Math.round(line.x1) - cameraX;
-        int y1 = Math.round(line.y1) - cameraY;
-        int x2 = Math.round(line.x2) - cameraX;
-        int y2 = Math.round(line.y2) - cameraY;
-
-        g2.setColor(i == selectedLine ? Color.YELLOW : Color.GREEN);
-        g2.drawLine(x1, y1, x2, y2);
-
-        g2.fillOval(x1 - 4, y1 - 4, 8, 8);
-        g2.fillOval(x2 - 4, y2 - 4, 8, 8);
-    }
-
-    if (currentTab == TAB_COLLISION && mx >= 0 && mx < viewW && !inMini(mx, my)) {
-        int px = snapX(mx) - cameraX, py = snapY(my) - cameraY;
-        if (drawingLine) {
-            g2.setColor(new Color(255, 255, 255, 160));
-            g2.drawLine(lineStartX - cameraX, lineStartY - cameraY, px, py);
-            g2.fillOval(lineStartX - cameraX - 5, lineStartY - cameraY - 5, 10, 10);
-        }
-        g2.setStroke(new BasicStroke(2));
-        g2.setColor(Color.CYAN);
-        g2.drawOval(px - 6, py - 6, 12, 12);
-    }
-
-    g2.setStroke(new BasicStroke(1));
-}
-
-void drawCollisionTab(Graphics2D g2, Color bg) {
-    int startY = CONTENT_Y + 196;
-    int rowHeight = 28;
-
-    g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 13f));
-    for (int i = 0; i < collisionLines.size(); i++) {
-        int y = startY + i * rowHeight - scroll;
-
-        if (y + rowHeight < CONTENT_Y || y > contentBottom) {
-            continue;
-        }
-
-        CollisionLine line = collisionLines.get(i);
-
-        g2.setColor(i == selectedLine
-                ? new Color(90, 80, 35)
-                : new Color(45, 45, 45));
-
-        g2.fillRect(contentX(), y, menuWidth - 40, rowHeight - 2);
-
-        g2.setColor(i == selectedLine ? Color.YELLOW : Color.LIGHT_GRAY);
-
-        String label = "Line " + i + ": ("
-                + Math.round(line.x1) + ", " + Math.round(line.y1)
-                + ") -> ("
-                + Math.round(line.x2) + ", " + Math.round(line.y2) + ")";
-
-        g2.drawString(label, contentX() + 6, y + 18);
-    }
-
-    g2.setColor(bg);
-    g2.fillRect(menuStartX, CONTENT_Y, menuWidth, startY - CONTENT_Y);
-
-    g2.setColor(Color.WHITE);
-    g2.setFont(g2.getFont().deriveFont(Font.BOLD, 14f));
-    g2.drawString("Collision Settings", contentX(), CONTENT_Y + 22);
-
-    drawButton(g2, collisionOneWayRect(),
-            "One-way: " + (lineOneWay ? "ON" : "OFF"));
-
-    drawButton(g2, collisionOrientationRect(),
-            "Orientation: " + orientationName(lineOrientation));
-
-    drawButton(g2, collisionOrientation2Rect(),
-            "Orientation 2: " + orientationName(lineOrientation2));
-
-    g2.setColor(Color.GRAY);
-    g2.setFont(g2.getFont().deriveFont(12f));
-    g2.drawString("Click to start a line, click again to finish it.",
-            contentX(), CONTENT_Y + 150);
-    g2.drawString("Right-click a line to erase it (or cancel one).",
-            contentX(), CONTENT_Y + 168);
-
-    g2.setColor(Color.WHITE);
-    g2.setFont(g2.getFont().deriveFont(Font.BOLD, 13f));
-    g2.drawString("Collision Lines (" + collisionLines.size() + ")",
-            contentX(), CONTENT_Y + 188);
-}
-
-    String orientationName(int orientation) {
-        switch (orientation) {
-            case 0: return "Top";
-            case 1: return "Right";
-            case 2: return "Bottom";
-            case 3: return "Left";
-            default: return "None";
-        }
-    }
-
-    java.awt.Rectangle collisionOneWayRect() {
-        return new java.awt.Rectangle(contentX(), CONTENT_Y + 36, 260, 28);
-    }
-
-    java.awt.Rectangle collisionOrientationRect() {
-        return new java.awt.Rectangle(contentX(), CONTENT_Y + 70, 260, 28);
-    }
-
-    java.awt.Rectangle collisionOrientation2Rect() {
-        return new java.awt.Rectangle(contentX(), CONTENT_Y + 104, 260, 28);
-    }
-
-    void drawTilesTab(Graphics2D g2) {
-        int startX = contentX() + 10;
-        int startY = CONTENT_Y + 10 - scroll;
-        if (tiles == null) {
-            g2.setColor(Color.GRAY);
-            g2.drawString("[ Import a tilesheet (toolbar) ]", contentX(), CONTENT_Y + 30);
-            return;
-        }
-        for (int i = 0; i < tiles.length; i++) {
-            int tx = startX + (i % 4) * 72;
-            int ty = startY + (i / 4) * 72;
-            g2.drawImage(tiles[i].subImage, tx, ty, 64, 64, null);
-            if (i == selectedTileIndex) {
-                g2.setColor(Color.YELLOW);
-                g2.setStroke(new BasicStroke(3));
-                g2.drawRect(tx - 2, ty - 2, 68, 68);
-                g2.setStroke(new BasicStroke(1));
-            }
-        }
     }
 
     void drawLayersTab(Graphics2D g2, Color bg) {
@@ -1035,6 +868,931 @@ void drawCollisionTab(Graphics2D g2, Color bg) {
         return new java.awt.Rectangle(contentX(), 188, 340, 30);
     }
 
+    int snap(double v) {
+        int half = tile / 2;
+        return (int) Math.round(v / half) * half;
+    }
+
+    int snapX(double screenX) {
+        return Math.max(0, Math.min(mapWidth * tile, snap(screenX / zoom + cameraX)));
+    }
+
+    int snapY(double screenY) {
+        return Math.max(0, Math.min(mapHeight * tile, snap(screenY / zoom + cameraY)));
+    }
+
+    int nearestLine(double px, double py, double maxDist) {
+        int best = -1;
+        double bestDist = maxDist;
+        for (int i = 0; i < collisionLines.size(); i++) {
+            CollisionLine l = collisionLines.get(i);
+            double dx = l.x2 - l.x1, dy = l.y2 - l.y1;
+            double len2 = dx * dx + dy * dy;
+            double t = len2 == 0 ? 0 : Math.max(0, Math.min(1, ((px - l.x1) * dx + (py - l.y1) * dy) / len2));
+            double d = Math.hypot(px - (l.x1 + t * dx), py - (l.y1 + t * dy));
+            if (d <= bestDist) {
+                bestDist = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    void collisionClick(boolean remove) {
+        double wx = mx / zoom + cameraX, wy = my / zoom + cameraY;
+        if (wx < -16 || wy < -16 || wx > mapWidth * tile + 16 || wy > mapHeight * tile + 16) return;
+
+        if (remove) {
+            if (drawingLine) {
+                drawingLine = false;
+                return;
+            }
+            int i = nearestLine(wx, wy, 10 / zoom);
+            if (i >= 0) {
+                collisionLines.remove(i);
+                if (selectedLine == i) selectedLine = -1;
+                else if (selectedLine > i) selectedLine--;
+            }
+            return;
+        }
+
+        int px = snapX(mx), py = snapY(my);
+        if (!drawingLine) {
+            lineStartX = px;
+            lineStartY = py;
+            drawingLine = true;
+            return;
+        }
+
+        drawingLine = false;
+        if (px == lineStartX && py == lineStartY) return;
+        collisionLines.add(new CollisionLine(lineStartX, lineStartY, px, py, lineOneWay, lineOrientation, lineOrientation2));
+    }
+
+    void clickCollision(int x, int y) {
+        if (collisionOneWayRect().contains(x, y)) {
+            lineOneWay = !lineOneWay;
+        } else if (collisionOrientationRect().contains(x, y)) {
+            lineOrientation = (lineOrientation + 1) % 5;
+        } else if (collisionOrientation2Rect().contains(x, y)) {
+            lineOrientation2 = (lineOrientation2 + 1) % 5;
+        } else {
+            int startY = CONTENT_Y + 196;
+            int rowHeight = 28;
+            if (y < startY) return;
+            for (int i = 0; i < collisionLines.size(); i++) {
+                int ry = startY + i * rowHeight - scroll;
+                if (y >= ry && y < ry + rowHeight - 2) {
+                    selectedLine = i;
+                    return;
+                }
+            }
+        }
+    }
+
+    void drawCollisionLines(Graphics2D g2) {
+        float px = 1f / zoom;
+        g2.setStroke(new BasicStroke(3 * px));
+
+        for (int i = 0; i < collisionLines.size(); i++) {
+
+            if(drawlines) {return;}
+
+            CollisionLine line = collisionLines.get(i);
+
+            int x1 = Math.round(line.x1);
+            int y1 = Math.round(line.y1);
+            int x2 = Math.round(line.x2);
+            int y2 = Math.round(line.y2);
+
+            g2.setColor(i == selectedLine ? Color.YELLOW : Color.GREEN);
+            g2.drawLine(x1, y1, x2, y2);
+            g2.fill(new java.awt.geom.Ellipse2D.Float(x1 - 4 * px, y1 - 4 * px, 8 * px, 8 * px));
+            g2.fill(new java.awt.geom.Ellipse2D.Float(x2 - 4 * px, y2 - 4 * px, 8 * px, 8 * px));
+        }
+
+        if (currentTab == TAB_COLLISION && mouseInView()) {
+            int cx = snapX(mx), cy = snapY(my);
+            if (drawingLine) {
+                g2.setColor(new Color(255, 255, 255, 160));
+                g2.drawLine(lineStartX, lineStartY, cx, cy);
+                g2.fill(new java.awt.geom.Ellipse2D.Float(lineStartX - 5 * px, lineStartY - 5 * px, 10 * px, 10 * px));
+            }
+            g2.setStroke(new BasicStroke(2 * px));
+            g2.setColor(Color.CYAN);
+            g2.draw(new java.awt.geom.Ellipse2D.Float(cx - 6 * px, cy - 6 * px, 12 * px, 12 * px));
+        }
+
+        g2.setStroke(new BasicStroke(1));
+    }
+
+    void drawCollisionTab(Graphics2D g2, Color bg) {
+        int startY = CONTENT_Y + 196;
+        int rowHeight = 28;
+
+        g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 13f));
+        for (int i = 0; i < collisionLines.size(); i++) {
+            int y = startY + i * rowHeight - scroll;
+
+            if (y + rowHeight < CONTENT_Y || y > contentBottom) {
+                continue;
+            }
+
+            CollisionLine line = collisionLines.get(i);
+
+            g2.setColor(i == selectedLine
+                    ? new Color(90, 80, 35)
+                    : new Color(45, 45, 45));
+
+            g2.fillRect(contentX(), y, menuWidth - 40, rowHeight - 2);
+
+            g2.setColor(i == selectedLine ? Color.YELLOW : Color.LIGHT_GRAY);
+
+            String label = "Line " + i + ": ("
+                    + Math.round(line.x1) + ", " + Math.round(line.y1)
+                    + ") -> ("
+                    + Math.round(line.x2) + ", " + Math.round(line.y2) + ")";
+
+            g2.drawString(label, contentX() + 6, y + 18);
+        }
+
+        g2.setColor(bg);
+        g2.fillRect(menuStartX, CONTENT_Y, menuWidth, startY - CONTENT_Y);
+
+        g2.setColor(Color.WHITE);
+        g2.setFont(g2.getFont().deriveFont(Font.BOLD, 14f));
+        g2.drawString("Collision Settings", contentX(), CONTENT_Y + 22);
+
+        drawButton(g2, collisionOneWayRect(),
+                "One-way: " + (lineOneWay ? "ON" : "OFF"));
+
+        drawButton(g2, collisionOrientationRect(),
+                "Orientation: " + orientationName(lineOrientation));
+
+        drawButton(g2, collisionOrientation2Rect(),
+                "Orientation 2: " + orientationName(lineOrientation2));
+
+        g2.setColor(Color.GRAY);
+        g2.setFont(g2.getFont().deriveFont(12f));
+        g2.drawString("Click to start a line, click again to finish it.",
+                contentX(), CONTENT_Y + 150);
+        g2.drawString("Right-click a line to erase it (or cancel one).",
+                contentX(), CONTENT_Y + 168);
+
+        g2.setColor(Color.WHITE);
+        g2.setFont(g2.getFont().deriveFont(Font.BOLD, 13f));
+        g2.drawString("Collision Lines (" + collisionLines.size() + ")",
+                contentX(), CONTENT_Y + 188);
+    }
+
+    String orientationName(int orientation) {
+        switch (orientation) {
+            case 0: return "Top";
+            case 1: return "Right";
+            case 2: return "Bottom";
+            case 3: return "Left";
+            default: return "None";
+        }
+    }
+
+    java.awt.Rectangle collisionOneWayRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 36, 260, 28);
+    }
+
+    java.awt.Rectangle collisionOrientationRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 70, 260, 28);
+    }
+
+    java.awt.Rectangle collisionOrientation2Rect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 104, 260, 28);
+    }
+
+    boolean tileTab() {
+        return currentTab == TAB_TILES || currentTab == TAB_LAYERS;
+    }
+
+    boolean hasTile() {
+        return tiles != null && selectedTileIndex >= 0 && selectedTileIndex < tiles.length;
+    }
+
+    int cellAtX(double screenX) {
+        return (int) Math.floor((screenX / zoom + cameraX) / tile);
+    }
+
+    int cellAtY(double screenY) {
+        return (int) Math.floor((screenY / zoom + cameraY) / tile);
+    }
+
+    int clampCol(int col) {
+        return Math.max(0, Math.min(mapWidth - 1, col));
+    }
+
+    int clampRow(int row) {
+        return Math.max(0, Math.min(mapHeight - 1, row));
+    }
+
+    int visCol0() {
+        return Math.max(0, (int) (cameraX / tile));
+    }
+
+    int visCol1() {
+        return Math.min(mapWidth - 1, (int) ((cameraX + viewW / zoom) / tile));
+    }
+
+    int visRow0() {
+        return Math.max(0, (int) (cameraY / tile));
+    }
+
+    int visRow1() {
+        return Math.min(mapHeight - 1, (int) ((cameraY + viewH / zoom) / tile));
+    }
+
+    boolean visibleWorld(int x, int y, int w, int h) {
+        return x + w >= cameraX && x <= cameraX + viewW / zoom
+                && y + h >= cameraY && y <= cameraY + viewH / zoom;
+    }
+
+    boolean mouseInView() {
+        return mx >= 0 && my >= 0 && mx < viewW && my < viewH && !inMini(mx, my);
+    }
+
+    void zoomTo(float target, double sx, double sy) {
+        float newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, target));
+        if (newZoom == zoom) return;
+        double wx = sx / zoom + cameraX;
+        double wy = sy / zoom + cameraY;
+        zoom = newZoom;
+        cameraX = (float) (wx - sx / zoom);
+        cameraY = (float) (wy - sy / zoom);
+        clampCamera();
+    }
+
+    void resetEditState() {
+        openOp = null;
+        undoStack.clear();
+        redoStack.clear();
+        selActive = false;
+        selMode = 0;
+        floatBuf = null;
+        floatFromPaste = false;
+        rectDragging = false;
+        strokeLastX = NONE;
+        strokeLastY = NONE;
+    }
+
+    void setTile(int layerIndex, int x, int y, int value) {
+        if (!inBounds(x, y)) return;
+        int[][] layer = layers.get(layerIndex);
+        int old = layer[x][y];
+        if (old == value) return;
+        layer[x][y] = value;
+        if (openOp != null) openOp.add(x, y, old, value);
+        updateMiniPixel(x, y);
+    }
+
+    void beginOp() {
+        commitFloating();
+        openOp = new EditOp();
+        openOp.layer = currentLayer;
+    }
+
+    void endOp() {
+        if (openOp != null && openOp.size > 0) {
+            undoStack.add(openOp);
+            if (undoStack.size() > 100) undoStack.remove(0);
+            redoStack.clear();
+        }
+        openOp = null;
+    }
+
+    void cancelOp() {
+        EditOp op = openOp;
+        openOp = null;
+        if (op == null) return;
+        for (int i = op.size - 4; i >= 0; i -= 4) {
+            setTile(op.layer, op.data[i], op.data[i + 1], op.data[i + 2]);
+        }
+    }
+
+    void undo() {
+        commitFloating();
+        if (undoStack.isEmpty()) return;
+        EditOp op = undoStack.remove(undoStack.size() - 1);
+        for (int i = op.size - 4; i >= 0; i -= 4) {
+            setTile(op.layer, op.data[i], op.data[i + 1], op.data[i + 2]);
+        }
+        redoStack.add(op);
+        selActive = false;
+    }
+
+    void redo() {
+        commitFloating();
+        if (redoStack.isEmpty()) return;
+        EditOp op = redoStack.remove(redoStack.size() - 1);
+        for (int i = 0; i < op.size; i += 4) {
+            setTile(op.layer, op.data[i], op.data[i + 1], op.data[i + 3]);
+        }
+        undoStack.add(op);
+        selActive = false;
+    }
+
+    void setTool(int newTool) {
+        if (newTool == tool) return;
+        commitFloating();
+        if (newTool != TOOL_SELECT) selActive = false;
+        rectDragging = false;
+        tool = newTool;
+    }
+
+    boolean inBrush(int x, int y, int x0, int y0) {
+        if (!brushRound) return true;
+        double r = brushSize / 2.0;
+        double dx = x + 0.5 - (x0 + r);
+        double dy = y + 0.5 - (y0 + r);
+        return dx * dx + dy * dy <= r * r;
+    }
+
+    void stampBrush(int cx, int cy, int value) {
+        int n = brushSize;
+        int x0 = cx - (n - 1) / 2;
+        int y0 = cy - (n - 1) / 2;
+        for (int x = x0; x < x0 + n; x++) {
+            for (int y = y0; y < y0 + n; y++) {
+                if (inBrush(x, y, x0, y0)) setTile(currentLayer, x, y, value);
+            }
+        }
+    }
+
+    void strokeTo(int gx, int gy, int value) {
+        if (gx == strokeLastX && gy == strokeLastY) return;
+
+        if (strokeLastX == NONE) {
+            stampBrush(gx, gy, value);
+        } else {
+            int x = strokeLastX, y = strokeLastY;
+            int dx = Math.abs(gx - x), dy = Math.abs(gy - y);
+            int sx = x < gx ? 1 : -1, sy = y < gy ? 1 : -1;
+            int err = dx - dy;
+            while (true) {
+                stampBrush(x, y, value);
+                if (x == gx && y == gy) break;
+                int e2 = 2 * err;
+                if (e2 > -dy) {
+                    err -= dy;
+                    x += sx;
+                }
+                if (e2 < dx) {
+                    err += dx;
+                    y += sy;
+                }
+            }
+        }
+        strokeLastX = gx;
+        strokeLastY = gy;
+    }
+
+    void applyRect(int x0, int y0, int x1, int y1, int value) {
+        int minX = Math.min(x0, x1), maxX = Math.max(x0, x1);
+        int minY = Math.min(y0, y1), maxY = Math.max(y0, y1);
+        beginOp();
+        for (int x = minX; x <= maxX; x++) {
+            for (int y = minY; y <= maxY; y++) {
+                if (squareFilled || x == minX || x == maxX || y == minY || y == maxY) {
+                    setTile(currentLayer, x, y, value);
+                }
+            }
+        }
+        endOp();
+    }
+
+    void floodFill(int sx, int sy, int value) {
+        if (!inBounds(sx, sy)) return;
+        int[][] layer = layers.get(currentLayer);
+        int target = layer[sx][sy];
+        if (target == value) return;
+
+        beginOp();
+        int[] stack = new int[mapWidth * mapHeight];
+        int sp = 0;
+        setTile(currentLayer, sx, sy, value);
+        stack[sp++] = sy * mapWidth + sx;
+        int[] dxs = {1, -1, 0, 0};
+        int[] dys = {0, 0, 1, -1};
+        while (sp > 0) {
+            int p = stack[--sp];
+            int x = p % mapWidth, y = p / mapWidth;
+            for (int d = 0; d < 4; d++) {
+                int nx = x + dxs[d], ny = y + dys[d];
+                if (inBounds(nx, ny) && layer[nx][ny] == target) {
+                    setTile(currentLayer, nx, ny, value);
+                    stack[sp++] = ny * mapWidth + nx;
+                }
+            }
+        }
+        endOp();
+    }
+
+    int[][] copyRegion(int x, int y, int w, int h) {
+        int[][] out = new int[w][h];
+        int[][] layer = layers.get(currentLayer);
+        for (int i = 0; i < w; i++) {
+            for (int j = 0; j < h; j++) {
+                out[i][j] = inBounds(x + i, y + j) ? layer[x + i][y + j] : -1;
+            }
+        }
+        return out;
+    }
+
+    int[][] copyBuffer(int[][] source) {
+        int[][] out = new int[source.length][];
+        for (int i = 0; i < source.length; i++) out[i] = source[i].clone();
+        return out;
+    }
+
+    boolean insideSelection(int gx, int gy) {
+        return selActive && gx >= selX && gx < selX + selW && gy >= selY && gy < selY + selH;
+    }
+
+    void selectPress(int gx, int gy, boolean erase) {
+        if (erase) {
+            commitFloating();
+            selActive = false;
+            return;
+        }
+
+        if (insideSelection(gx, gy)) {
+            if (floatBuf == null) {
+                beginOp();
+                floatBuf = copyRegion(selX, selY, selW, selH);
+                liftX = selX;
+                liftY = selY;
+                floatFromPaste = false;
+                for (int i = 0; i < selW; i++) {
+                    for (int j = 0; j < selH; j++) setTile(currentLayer, selX + i, selY + j, -1);
+                }
+            }
+            moveOffX = gx - selX;
+            moveOffY = gy - selY;
+            selMode = 2;
+            return;
+        }
+
+        commitFloating();
+        selActive = true;
+        selAnchorX = clampCol(gx);
+        selAnchorY = clampRow(gy);
+        selX = selAnchorX;
+        selY = selAnchorY;
+        selW = 1;
+        selH = 1;
+        selMode = 1;
+    }
+
+    void dragSelection(int gx, int gy) {
+        if (selMode == 1) {
+            int cx = clampCol(gx), cy = clampRow(gy);
+            selX = Math.min(selAnchorX, cx);
+            selY = Math.min(selAnchorY, cy);
+            selW = Math.abs(cx - selAnchorX) + 1;
+            selH = Math.abs(cy - selAnchorY) + 1;
+        } else if (selMode == 2) {
+            selX = gx - moveOffX;
+            selY = gy - moveOffY;
+        }
+    }
+
+    void commitFloating() {
+        if (floatBuf == null) return;
+        if (!floatFromPaste && selX == liftX && selY == liftY) {
+            cancelOp();
+        } else {
+            for (int i = 0; i < selW; i++) {
+                for (int j = 0; j < selH; j++) {
+                    if (floatBuf[i][j] != -1) setTile(currentLayer, selX + i, selY + j, floatBuf[i][j]);
+                }
+            }
+            endOp();
+        }
+        floatBuf = null;
+        floatFromPaste = false;
+    }
+
+    void cancelFloating() {
+        if (floatBuf == null) return;
+        cancelOp();
+        if (floatFromPaste) {
+            selActive = false;
+        } else {
+            selX = liftX;
+            selY = liftY;
+        }
+        floatBuf = null;
+        floatFromPaste = false;
+    }
+
+    void copySelection() {
+        if (!selActive) return;
+        clipboard = floatBuf != null ? copyBuffer(floatBuf) : copyRegion(selX, selY, selW, selH);
+    }
+
+    void deleteSelection() {
+        if (!selActive) return;
+        if (floatBuf != null) {
+            endOp();
+            floatBuf = null;
+            floatFromPaste = false;
+            selActive = false;
+            return;
+        }
+        beginOp();
+        for (int i = 0; i < selW; i++) {
+            for (int j = 0; j < selH; j++) setTile(currentLayer, selX + i, selY + j, -1);
+        }
+        endOp();
+        selActive = false;
+    }
+
+    void cutSelection() {
+        copySelection();
+        deleteSelection();
+    }
+
+    void pasteClipboard() {
+        if (clipboard == null) return;
+        commitFloating();
+        beginOp();
+        tool = TOOL_SELECT;
+        floatBuf = copyBuffer(clipboard);
+        selW = clipboard.length;
+        selH = clipboard[0].length;
+        boolean overMap = mx >= 0 && my >= 0 && mx < viewW && my < viewH;
+        selX = clampCol(overMap ? cellAtX(mx) : cellAtX(0) + 1);
+        selY = clampRow(overMap ? cellAtY(my) : cellAtY(0) + 1);
+        selActive = true;
+        floatFromPaste = true;
+    }
+
+    void escapeAction() {
+        if (rectDragging) {
+            rectDragging = false;
+        } else if (floatBuf != null) {
+            cancelFloating();
+        } else {
+            selActive = false;
+        }
+    }
+
+    void startTool() {
+        int gx = cellAtX(mx), gy = cellAtY(my);
+        boolean erase = button == MouseEvent.BUTTON3;
+        switch (tool) {
+            case TOOL_BRUSH:
+                beginOp();
+                strokeLastX = NONE;
+                strokeLastY = NONE;
+                if (erase) strokeTo(gx, gy, -1);
+                else if (hasTile()) strokeTo(gx, gy, selectedTileIndex);
+                break;
+            case TOOL_SQUARE:
+                commitFloating();
+                rectStartX = clampCol(gx);
+                rectStartY = clampRow(gy);
+                rectDragging = true;
+                break;
+            case TOOL_FILL:
+                if (erase) floodFill(gx, gy, -1);
+                else if (hasTile()) floodFill(gx, gy, selectedTileIndex);
+                break;
+            default:
+                selectPress(gx, gy, erase);
+                break;
+        }
+    }
+
+    void finishTool() {
+        boolean erase = button == MouseEvent.BUTTON3;
+        switch (tool) {
+            case TOOL_BRUSH:
+                endOp();
+                strokeLastX = NONE;
+                strokeLastY = NONE;
+                break;
+            case TOOL_SQUARE:
+                if (rectDragging) {
+                    rectDragging = false;
+                    int cx = clampCol(cellAtX(mx)), cy = clampRow(cellAtY(my));
+                    if (erase) applyRect(rectStartX, rectStartY, cx, cy, -1);
+                    else if (hasTile()) applyRect(rectStartX, rectStartY, cx, cy, selectedTileIndex);
+                }
+                break;
+            case TOOL_SELECT:
+                selMode = 0;
+                break;
+            default:
+                break;
+        }
+    }
+
+    void controlKey(int code, boolean shift) {
+        switch (code) {
+            case KeyEvent.VK_C: copySelection(); break;
+            case KeyEvent.VK_X: cutSelection(); break;
+            case KeyEvent.VK_V: pasteClipboard(); break;
+            case KeyEvent.VK_Z:
+                if (shift) redo();
+                else undo();
+                break;
+            case KeyEvent.VK_Y: redo(); break;
+            default: break;
+        }
+    }
+
+    void toolKey(int code) {
+        switch (code) {
+            case KeyEvent.VK_B: setTool(TOOL_BRUSH); break;
+            case KeyEvent.VK_R: setTool(TOOL_SQUARE); break;
+            case KeyEvent.VK_F: setTool(TOOL_FILL); break;
+            case KeyEvent.VK_V: setTool(TOOL_SELECT); break;
+            case KeyEvent.VK_0: zoomTo(1f, viewW / 2.0, viewH / 2.0); break;
+            case KeyEvent.VK_ENTER: commitFloating(); break;
+            case KeyEvent.VK_ESCAPE: escapeAction(); break;
+            case KeyEvent.VK_DELETE:
+            case KeyEvent.VK_BACK_SPACE:
+                deleteSelection();
+                break;
+            default: break;
+        }
+    }
+
+    void drawGhost(Graphics2D g2, int x, int y) {
+        if (!hasTile() || !inBounds(x, y)) return;
+        g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.5f));
+        g2.drawImage(tiles[selectedTileIndex].subImage, x * tile, y * tile, tile, tile, null);
+        g2.setComposite(AlphaComposite.SrcOver);
+    }
+
+    void drawCellOutline(Graphics2D g2, int gx, int gy, float px) {
+        if (!inBounds(gx, gy)) return;
+        g2.setStroke(new BasicStroke(2 * px));
+        g2.setColor(Color.WHITE);
+        g2.drawRect(gx * tile, gy * tile, tile, tile);
+    }
+
+    void drawBrushPreview(Graphics2D g2, int gx, int gy, float px) {
+        int n = brushSize;
+        int x0 = gx - (n - 1) / 2;
+        int y0 = gy - (n - 1) / 2;
+        for (int x = x0; x < x0 + n; x++) {
+            for (int y = y0; y < y0 + n; y++) {
+                if (!inBrush(x, y, x0, y0) || !inBounds(x, y)) continue;
+                drawGhost(g2, x, y);
+                g2.setColor(new Color(255, 255, 255, 50));
+                g2.fillRect(x * tile, y * tile, tile, tile);
+            }
+        }
+        if (!brushRound) {
+            g2.setStroke(new BasicStroke(2 * px));
+            g2.setColor(Color.WHITE);
+            g2.drawRect(x0 * tile, y0 * tile, n * tile, n * tile);
+        }
+    }
+
+    void drawRectPreview(Graphics2D g2, float px) {
+        int cx = clampCol(cellAtX(mx)), cy = clampRow(cellAtY(my));
+        int minX = Math.min(rectStartX, cx), maxX = Math.max(rectStartX, cx);
+        int minY = Math.min(rectStartY, cy), maxY = Math.max(rectStartY, cy);
+        boolean erase = button == MouseEvent.BUTTON3;
+
+        int x1 = Math.min(maxX, visCol1()), y1 = Math.min(maxY, visRow1());
+        for (int x = Math.max(minX, visCol0()); x <= x1; x++) {
+            for (int y = Math.max(minY, visRow0()); y <= y1; y++) {
+                if (!squareFilled && x != minX && x != maxX && y != minY && y != maxY) continue;
+                if (erase) {
+                    g2.setColor(new Color(255, 0, 0, 90));
+                    g2.fillRect(x * tile, y * tile, tile, tile);
+                } else {
+                    drawGhost(g2, x, y);
+                }
+            }
+        }
+
+        g2.setStroke(new BasicStroke(2 * px));
+        g2.setColor(Color.YELLOW);
+        g2.drawRect(minX * tile, minY * tile, (maxX - minX + 1) * tile, (maxY - minY + 1) * tile);
+    }
+
+    void drawSelection(Graphics2D g2, float px) {
+        if (floatBuf != null && tiles != null) {
+            int i0 = Math.max(0, visCol0() - selX), i1 = Math.min(selW - 1, visCol1() - selX);
+            int j0 = Math.max(0, visRow0() - selY), j1 = Math.min(selH - 1, visRow1() - selY);
+            for (int i = i0; i <= i1; i++) {
+                for (int j = j0; j <= j1; j++) {
+                    int id = floatBuf[i][j];
+                    if (id >= 0 && id < tiles.length && inBounds(selX + i, selY + j)) {
+                        g2.drawImage(tiles[id].subImage, (selX + i) * tile, (selY + j) * tile, tile, tile, null);
+                    }
+                }
+            }
+        }
+
+        g2.setColor(new Color(255, 255, 0, 40));
+        g2.fillRect(selX * tile, selY * tile, selW * tile, selH * tile);
+        g2.setStroke(new BasicStroke(2 * px, BasicStroke.CAP_BUTT, BasicStroke.JOIN_MITER, 10f,
+                new float[]{8 * px, 6 * px}, 0f));
+        g2.setColor(Color.YELLOW);
+        g2.drawRect(selX * tile, selY * tile, selW * tile, selH * tile);
+        g2.setStroke(new BasicStroke(1));
+    }
+
+    void drawToolOverlay(Graphics2D g2) {
+        float px = 1f / zoom;
+        if (selActive) drawSelection(g2, px);
+        if (!tileTab() || !mouseInView()) return;
+
+        int gx = cellAtX(mx), gy = cellAtY(my);
+        switch (tool) {
+            case TOOL_BRUSH:
+                drawBrushPreview(g2, gx, gy, px);
+                break;
+            case TOOL_SQUARE:
+                if (rectDragging) {
+                    drawRectPreview(g2, px);
+                } else {
+                    drawGhost(g2, gx, gy);
+                    drawCellOutline(g2, gx, gy, px);
+                }
+                break;
+            case TOOL_FILL:
+                drawGhost(g2, gx, gy);
+                drawCellOutline(g2, gx, gy, px);
+                break;
+            default:
+                if (!insideSelection(gx, gy)) drawCellOutline(g2, gx, gy, px);
+                break;
+        }
+        g2.setStroke(new BasicStroke(1));
+    }
+
+    java.awt.Rectangle toolRect(int i) {
+        return new java.awt.Rectangle(contentX() + i * 91, CONTENT_Y + 6, 86, 28);
+    }
+
+    java.awt.Rectangle sliderRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 44, 250, 26);
+    }
+
+    java.awt.Rectangle shapeRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 78, 190, 28);
+    }
+
+    java.awt.Rectangle fillRect() {
+        return new java.awt.Rectangle(contentX(), CONTENT_Y + 44, 190, 28);
+    }
+
+    java.awt.Rectangle selButtonRect(int i) {
+        return new java.awt.Rectangle(contentX() + i * 91, CONTENT_Y + 44, 86, 28);
+    }
+
+    void setBrushFromX(int x) {
+        java.awt.Rectangle s = sliderRect();
+        int size = 1 + (int) Math.round((x - s.x) / (double) s.width * 19);
+        brushSize = Math.max(1, Math.min(20, size));
+    }
+
+    void drawToolsPanel(Graphics2D g2, Color bg) {
+        g2.setColor(bg);
+        g2.fillRect(menuStartX, CONTENT_Y, menuWidth, TOOLS_H + 4);
+
+        g2.setFont(g2.getFont().deriveFont(Font.BOLD, 13f));
+        for (int i = 0; i < toolNames.length; i++) {
+            java.awt.Rectangle r = toolRect(i);
+            drawButton(g2, r, toolNames[i]);
+            if (i == tool) {
+                g2.setColor(new Color(255, 255, 0, 45));
+                g2.fillRoundRect(r.x, r.y, r.width, r.height, 8, 8);
+                g2.setColor(Color.YELLOW);
+                g2.drawRoundRect(r.x, r.y, r.width, r.height, 8, 8);
+            }
+        }
+
+        g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 13f));
+        if (tool == TOOL_BRUSH) {
+            java.awt.Rectangle s = sliderRect();
+            int trackY = s.y + s.height / 2;
+            g2.setColor(Color.GRAY);
+            g2.fillRect(s.x, trackY - 2, s.width, 4);
+            int hx = s.x + (int) ((brushSize - 1) / 19.0 * s.width);
+            g2.setColor(Color.YELLOW);
+            g2.fillOval(hx - 7, trackY - 7, 14, 14);
+            g2.setColor(Color.WHITE);
+            g2.drawString("Size: " + brushSize, s.x + s.width + 12, trackY + 5);
+            drawButton(g2, shapeRect(), "Shape: " + (brushRound ? "Round" : "Square"));
+        } else if (tool == TOOL_SQUARE) {
+            drawButton(g2, fillRect(), "Fill: " + (squareFilled ? "Filled" : "Outline"));
+        } else if (tool == TOOL_SELECT) {
+            for (int i = 0; i < selectButtons.length; i++) drawButton(g2, selButtonRect(i), selectButtons[i]);
+        }
+
+        g2.setFont(g2.getFont().deriveFont(Font.PLAIN, 12f));
+        g2.setColor(Color.GRAY);
+        String[] hint;
+        switch (tool) {
+            case TOOL_BRUSH:
+                hint = new String[]{"Drag to paint, right-drag to erase.", "Ctrl+Z / Ctrl+Y undo and redo."};
+                break;
+            case TOOL_SQUARE:
+                hint = new String[]{"Drag a rectangle. Right-drag erases it.", "Esc cancels while dragging."};
+                break;
+            case TOOL_FILL:
+                hint = new String[]{"Click to fill a connected area.", "Right-click erases the area."};
+                break;
+            default:
+                hint = new String[]{"Drag to select, drag inside to move.", "Ctrl+C / X / V, Del, Enter drops, Esc cancels."};
+                break;
+        }
+        g2.drawString(hint[0], contentX(), CONTENT_Y + 126);
+        g2.drawString(hint[1], contentX(), CONTENT_Y + 142);
+    }
+
+    boolean clickTools(int x, int y) {
+        if (y >= CONTENT_Y + TOOLS_H) return false;
+
+        for (int i = 0; i < toolNames.length; i++) {
+            if (toolRect(i).contains(x, y)) {
+                setTool(i);
+                return true;
+            }
+        }
+
+        if (tool == TOOL_BRUSH) {
+            if (sliderRect().contains(x, y)) {
+                sliderDrag = true;
+                setBrushFromX(x);
+            } else if (shapeRect().contains(x, y)) {
+                brushRound = !brushRound;
+            }
+        } else if (tool == TOOL_SQUARE) {
+            if (fillRect().contains(x, y)) squareFilled = !squareFilled;
+        } else if (tool == TOOL_SELECT) {
+            if (selButtonRect(0).contains(x, y)) copySelection();
+            else if (selButtonRect(1).contains(x, y)) cutSelection();
+            else if (selButtonRect(2).contains(x, y)) pasteClipboard();
+            else if (selButtonRect(3).contains(x, y)) deleteSelection();
+        }
+        return true;
+    }
+
+    void drawTilesTab(Graphics2D g2, Color bg) {
+        int startX = contentX() + 10;
+        int startY = CONTENT_Y + TOOLS_H + 10 - scroll;
+        if (tiles == null) {
+            g2.setColor(Color.GRAY);
+            g2.drawString("[ Import a tilesheet (toolbar) ]", contentX(), CONTENT_Y + TOOLS_H + 30);
+        } else {
+            for (int i = 0; i < tiles.length; i++) {
+                int tx = startX + (i % 4) * 72;
+                int ty = startY + (i / 4) * 72;
+                if (ty + 64 < CONTENT_Y || ty > contentBottom) continue;
+                g2.drawImage(tiles[i].subImage, tx, ty, 64, 64, null);
+                if (i == selectedTileIndex) {
+                    g2.setColor(Color.YELLOW);
+                    g2.setStroke(new BasicStroke(3));
+                    g2.drawRect(tx - 2, ty - 2, 68, 68);
+                    g2.setStroke(new BasicStroke(1));
+                }
+            }
+        }
+        drawToolsPanel(g2, bg);
+    }
+
+    void clickTiles(int x, int y) {
+        if (clickTools(x, y)) return;
+        if (tiles == null) return;
+        int startX = contentX() + 10;
+        int startY = CONTENT_Y + TOOLS_H + 10 - scroll;
+        for (int i = 0; i < tiles.length; i++) {
+            int tx = startX + (i % 4) * 72;
+            int ty = startY + (i / 4) * 72;
+            if (x >= tx && x <= tx + 64 && y >= ty && y <= ty + 64) {
+                selectedTileIndex = i;
+                return;
+            }
+        }
+    }
+
+    int tileAt(int gx, int gy) {
+        if (!inBounds(gx, gy)) return -1;
+        return layers.get(currentLayer)[gx][gy];
+    }
+
+    public int[][] getSurroundingTiles(int gx, int gy) {
+        return new int[][]{
+            {tileAt(gx - 1, gy - 1), tileAt(gx, gy - 1), tileAt(gx + 1, gy - 1)},
+            {tileAt(gx - 1, gy),     tileAt(gx, gy),     tileAt(gx + 1, gy)},
+            {tileAt(gx - 1, gy + 1), tileAt(gx, gy + 1), tileAt(gx + 1, gy + 1)}
+        };
+    }
+
     void drawButton(Graphics2D g2, java.awt.Rectangle r, String label) {
         g2.setColor(new Color(70, 70, 70));
         g2.fillRoundRect(r.x, r.y, r.width, r.height, 8, 8);
@@ -1050,6 +1808,9 @@ void drawCollisionTab(Graphics2D g2, Color bg) {
         if (y < TAB_BAR_H) {
             int t = Math.max(0, Math.min(tabNames.length - 1, (x - menuStartX) / (menuWidth / tabNames.length)));
             if (t != currentTab) {
+                commitFloating();
+                selActive = false;
+                rectDragging = false;
                 currentTab = t;
                 scroll = 0;
             }
@@ -1100,21 +1861,9 @@ void drawCollisionTab(Graphics2D g2, Color bg) {
         return current;
     }
 
-    void clickTiles(int x, int y) {
-        if (tiles == null) return;
-        int startX = contentX() + 10;
-        int startY = CONTENT_Y + 10 - scroll;
-        for (int i = 0; i < tiles.length; i++) {
-            int tx = startX + (i % 4) * 72;
-            int ty = startY + (i / 4) * 72;
-            if (x >= tx && x <= tx + 64 && y >= ty && y <= ty + 64) {
-                selectedTileIndex = i;
-                return;
-            }
-        }
-    }
-
     void clickLayers(int x, int y) {
+        commitFloating();
+        selActive = false;
         if (buttonRect().contains(x, y)) {
             addLayer();
             return;
@@ -1137,7 +1886,7 @@ void drawCollisionTab(Graphics2D g2, Color bg) {
         int end;
         switch (currentTab) {
             case TAB_TILES:
-                end = CONTENT_Y + 10 + (tiles == null ? 0 : (tiles.length + 3) / 4 * 72);
+                end = CONTENT_Y + TOOLS_H + 10 + (tiles == null ? 0 : (tiles.length + 3) / 4 * 72);
                 break;
             case TAB_LAYERS: end = listY() + layers.size() * ROW_H; break;
             case TAB_ENTITY: end = listY() + entityTypes.size() * ROW_H; break;
@@ -1167,33 +1916,66 @@ void drawCollisionTab(Graphics2D g2, Color bg) {
             return;
         }
         dragMode = 2;
-
-        if (currentTab == TAB_COLLISION) {
-            collisionClick(button == MouseEvent.BUTTON3);
-        }
-
+        if (tileTab()) startTool();
+        if (currentTab == TAB_COLLISION) collisionClick(button == MouseEvent.BUTTON3);
         if (currentTab == TAB_ENTITY || currentTab == TAB_EVENT) {
-            int gx = (int) Math.floor((mx + cameraX) / tile);
-            int gy = (int) Math.floor((my + cameraY) / tile);
+            int gx = cellAtX(mx);
+            int gy = cellAtY(my);
             if (inBounds(gx, gy)) placeOrRemove(gx, gy, button == MouseEvent.BUTTON3);
         }
     }
 
     @Override
     public void mouseWheelMoved(MouseWheelEvent e) {
-        if (e.getX() < menuStartX) return;
+        if (e.getX() < menuStartX) {
+            zoomTo((float) (zoom * Math.pow(1.15, -e.getPreciseWheelRotation())), e.getX(), e.getY());
+            return;
+        }
         scroll = Math.max(0, Math.min(maxScroll(), scroll + e.getWheelRotation() * 40));
     }
 
-    @Override public void mouseReleased(MouseEvent e) { pressed = false; dragMode = 0; }
-    @Override public void mouseDragged(MouseEvent e) { mx = e.getX(); my = e.getY(); }
+    @Override
+    public void mouseReleased(MouseEvent e) {
+        mx = e.getX();
+        my = e.getY();
+        if (pressed && dragMode == 2 && tileTab()) finishTool();
+        pressed = false;
+        dragMode = 0;
+        sliderDrag = false;
+    }
+
+    @Override
+    public void mouseDragged(MouseEvent e) {
+        mx = e.getX();
+        my = e.getY();
+        if (sliderDrag) setBrushFromX(e.getX());
+    }
+
+    @Override
+    public void keyPressed(KeyEvent e) {
+        int code = e.getKeyCode();
+
+        if(code == KeyEvent.VK_TAB) {
+            if(currentLayer < layers.size()-1) {
+                currentLayer++;
+            }
+            else{
+                currentLayer = 0;
+            } 
+        }
+
+        setKey(code, true);
+        if (e.isControlDown() || e.isMetaDown()) {
+            controlKey(code, e.isShiftDown());
+        } else {
+            toolKey(code);
+        }
+    }
+
     @Override public void mouseMoved(MouseEvent e) { mx = e.getX(); my = e.getY(); }
     @Override public void mouseClicked(MouseEvent e) {}
     @Override public void mouseEntered(MouseEvent e) {}
     @Override public void mouseExited(MouseEvent e) {}
-
-    @Override
-    public void keyPressed(KeyEvent e) { setKey(e.getKeyCode(), true); }
 
     @Override
     public void keyReleased(KeyEvent e) { setKey(e.getKeyCode(), false); }
@@ -1225,12 +2007,12 @@ void drawCollisionTab(Graphics2D g2, Color bg) {
             JFrame frame = new JFrame();
             frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
             frame.setResizable(false);
-            frame.setTitle("Map Editor V1");
+            frame.setTitle("Expandable Tile Map Editor");
 
             Window window = new Window(frame);
 
             JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT));
-            toolbar.add(toolbarButton("Resize Map", window::newMapDialog));
+            toolbar.add(toolbarButton("New Map", window::newMapDialog));
             toolbar.add(toolbarButton("Import Tilesheet", window::importTilesheetDialog));
             toolbar.add(toolbarButton("Save", window::saveDialog));
             toolbar.add(toolbarButton("Load", window::loadDialog));
